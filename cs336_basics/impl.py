@@ -39,36 +39,46 @@ class Tokenizer:
                     Merges are ordered by order of creation.
         """
         
+        # reset attributes before training
+        self.__init__(self.verbose)
+        
         # initialize output
-        assert vocab_size >= 256
-        num_merges = vocab_size - 256 - len(special_tokens)
+        special_token_set = set(special_tokens)
+        assert vocab_size >= 256 + len(special_token_set)
+        num_merges = vocab_size - 256 - len(special_token_set)
         self.idx = 256
         
         # 1. read the file into memory
         raw_text: str = self.read_file(input_path)
         assert isinstance(raw_text, str), "should return str type"
         # handle special tokens 
-        ids: tuple[tuple[int, ...]] = self.encode_with_special_tokens(raw_text, special_tokens)
+        ids: list[list[int]] = self.encode_with_special_tokens(raw_text, special_token_set)
         
         # 3. recursively do token merges until the vocab size satisfies
+        # initiaze the stats, count up the number of times every consecutive pair appears
+        stats: dict[tuple[int, int], int] = {}
+        for chunk_ids in ids:
+            self.get_stats(tuple(chunk_ids), stats)
         for i in range(num_merges):
-            # count up the number of times every consecutive pair appears
-            stats: dict[tuple[int, int], int] = {}
-            for chunk_ids in ids:
-                self.get_stats(chunk_ids, stats)
+            new_token_id: int = self.idx
+            if len(stats) == 0: 
+                break
             # find the pair with highest count
-            pair: tuple[int, int] = max(stats, key=lambda k: (stats[k], k))
+            pair: tuple[int, int] = max(stats, key=lambda k: (stats[k], self.vocab[k[0]], self.vocab[k[1]]))
+            if stats[pair] == 0:
+                break
             # find out the merging bytes and new token id
-            new_ids: list[tuple[int, ...]] = []
+            new_ids: list[list[int]] = []
+            occurrence: int = stats[pair]
             for chunk_ids in ids:
-                new_ids.append(self.merge(chunk_ids, pair))
-            ids = tuple[tuple[int, ...]](new_ids)
+                new_ids.append(self.merge(tuple(chunk_ids), pair, stats, new_token_id))
+            ids = list[list[int]](new_ids)
             bytes_pair: tuple[bytes, bytes] = (self.vocab[pair[0]], self.vocab[pair[1]])
-            self.vocab[self.idx] = b''.join(bytes_pair)
+            self.vocab[new_token_id] = b''.join(bytes_pair)
             self.merges.append(bytes_pair)
 
             if self.verbose:
-                print(f"{i}/{num_merges}: {pair} -> {self.idx} ({self.vocab[self.idx]} has {stats[pair]} occurences)")
+                print(f"{i + 1}/{num_merges}: {pair} -> {self.idx} ({self.vocab[self.idx]} has {occurrence} occurrences)")
             self.idx += 1
             
         return (self.vocab, self.merges)
@@ -89,31 +99,63 @@ class Tokenizer:
             counts[pair] = counts.get(pair, 0) + 1
         return counts
 
-    def merge(self, ids: tuple[int, ...], pair: tuple[int, int]) -> tuple[int, ...]:
+    def merge(self, ids: tuple[int, ...], pair: tuple[int, int], stats: dict[tuple[int, int], int], new_token_id: int) -> list[int]:
         """
         In the list of integers, replace all consecutive occurences of pairs with the
         new integer token id
         eg. ids=[1,2,3,1,2], pair=(1,2), idx=4 -> [4,3,4]
+        
+        adjust the stats rather than recount it in every loop
         """
-        output: list[int] = []
+        new_ids: list[int] = []
         i = 0
         
         while i < len(ids):
-            if ids[i] == pair[0] and i < len(ids) - 1 and ids[i + 1] == pair[1]:
-                output.append(self.idx)
+            if i + 1 < len(ids) and ids[i] == pair[0] and ids[i + 1] == pair[1]:
+                new_ids.append(new_token_id)
                 i += 2
             else:
-                output.append(ids[i])
+                new_ids.append(ids[i])
                 i += 1
+
+        i = -1
+        while i + 1 < len(new_ids):
+            i += 1
+            if new_ids[i] != new_token_id:
+                continue
+            stats[(pair[0], pair[1])] -= 1
+            x = new_ids[i - 1] if i > 0 else -1
+            y = new_ids[i + 1] if i +1 < len(new_ids) else -1
+            if x == new_token_id:
+                # AB AB Y, (B, A) --
+                stats[(pair[1], pair[0])] -= 1
+                # (AB, AB) ++
+                stats[(new_token_id, new_token_id)] = stats.get((new_token_id, new_token_id), 0) + 1
+            else: 
+                # X AB, (X, A) --
+                if stats.get((x, pair[0]), 0) > 0:
+                    stats[x, pair[0]] -= 1
+                # (X, AB) ++
+                if x >= 0:
+                    stats[(x, new_token_id)] = stats.get((x, new_token_id), 0) + 1
             
-        return tuple(output)
+            # if y == new_token_id, then y will be as the next x and be handled
+            if y != new_token_id:
+                # AB, Y, (B, Y) --
+                if stats.get((pair[1], y), 0) > 0:
+                    stats[(pair[1], y)] -= 1
+                # (AB, Y) ++
+                if y >= 0:
+                    stats[(new_token_id, y)] = stats.get((new_token_id, y), 0) + 1
+        
+        return new_ids
 
     def encode_with_special_tokens(
         self, 
         text: str,
-        special_tokens: list[str],
-    ) -> tuple[tuple[int, ...]]:
-        ids = list[tuple[int, ...]]()
+        special_tokens: set[str],
+    ) -> list[list[int]]:
+        ids = list[list[int]]()
         
         # tokenize special tokens
         special_token_map: dict[str, int] = {k: 0 for k in special_tokens}
@@ -128,27 +170,19 @@ class Tokenizer:
         
         for chunk in chunks:
             if chunk in special_token_map:
-                if self.verbose:
-                    print(f"found special token:{chunk}")
                 # ids.append(special_token_map[chunk])
+                continue
             else:
-                ids.append(self.encode_ordinary(chunk))
+                ids.extend(self.encode_ordinary(chunk))
         
-        return tuple[tuple[int, ...]](ids)
+        return ids
     
-    def encode_ordinary(self, text: str) -> tuple[int, ...]: 
+    def encode_ordinary(self, text: str) -> list[list[int]]: 
         """encoding that igores any special tokens"""
         text_chunks = re.findall(self.compiled_pattern, text)
-        ids = list[int]()
-        
-        for chunk in text_chunks:
-           chunk_bytes: bytes = chunk.encode()
-           ids.extend(chunk_bytes)
-        
-        return tuple(ids)
-        
-        
-test_input_path = "/Users/linlin/repo/assignment1-basics/data/test.txt"
+        return [list(ch.encode()) for ch in text_chunks]
 
-_, merges = Tokenizer(True).run_train_bpe(test_input_path, 280, ["<|endoftext|>"])
-print(merges)
+# test_input_path = "/Users/linlin/repo/assignment1-basics/data/test.txt"
+# t = Tokenizer(True)
+# _, merges = t.run_train_bpe(test_input_path, 258, ["<|endoftext|>"])
+# print(merges)
